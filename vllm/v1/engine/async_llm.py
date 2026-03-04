@@ -75,6 +75,7 @@ class AsyncLLM(EngineClient):
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
+        use_uniproc_engine_core: bool = False,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
@@ -112,6 +113,7 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
+        self.default_sampling_params: dict[str, Any] | None = None
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
@@ -148,15 +150,30 @@ class AsyncLLM(EngineClient):
             tracing_enabled=tracing_endpoint is not None,
         )
 
-        # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
-            vllm_config=vllm_config,
-            executor_class=executor_class,
-            log_stats=self.log_stats,
-            client_addresses=client_addresses,
-            client_count=client_count,
-            client_index=client_index,
-        )
+        # EngineCore (starts the engine). By default use async MP client.
+        # If `use_uniproc_engine_core` is True, create an in-process client
+        # (InprocClient) and let the output handler call the blocking
+        # `get_output()` via `asyncio.to_thread()` so it doesn't block
+        # the event loop.
+        self._use_uniproc_engine_core = use_uniproc_engine_core
+        if use_uniproc_engine_core:
+            # multiprocess_mode=False, asyncio_mode=False -> InprocClient
+            self.engine_core = EngineCoreClient.make_client(
+                multiprocess_mode=False,
+                asyncio_mode=False,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=self.log_stats,
+            )
+        else:
+            self.engine_core = EngineCoreClient.make_async_mp_client(
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=self.log_stats,
+                client_addresses=client_addresses,
+                client_count=client_count,
+                client_index=client_index,
+            )
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
@@ -218,6 +235,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        use_uniproc_engine_core: bool = False,
     ) -> "AsyncLLM":
         # Create the LLMEngine.
         return cls(
@@ -232,6 +250,7 @@ class AsyncLLM(EngineClient):
             client_addresses=client_addresses,
             client_count=client_count,
             client_index=client_index,
+            use_uniproc_engine_core=use_uniproc_engine_core,
         )
 
     @classmethod
@@ -241,6 +260,7 @@ class AsyncLLM(EngineClient):
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
+        use_uniproc_engine_core: bool = False,
     ) -> "AsyncLLM":
         """Create an AsyncLLM from the EngineArgs."""
 
@@ -257,6 +277,7 @@ class AsyncLLM(EngineClient):
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            use_uniproc_engine_core=use_uniproc_engine_core,
         )
 
     def __del__(self):
@@ -276,6 +297,13 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+    def get_default_sampling_params(self) -> SamplingParams:
+        if self.default_sampling_params is None:
+            self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        if self.default_sampling_params:
+            return SamplingParams.from_optional(**self.default_sampling_params)
+        return SamplingParams()
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
@@ -692,12 +720,20 @@ class AsyncLLM(EngineClient):
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
                     if logger_manager:
-                        logger_manager.record(
-                            engine_idx=outputs.engine_index,
-                            scheduler_stats=outputs.scheduler_stats,
-                            iteration_stats=iteration_stats,
-                            mm_cache_stats=renderer.stat_mm_cache(),
-                        )
+                        try:
+                            # Offload recording to a background thread to avoid
+                            # blocking the event loop (Prometheus I/O can be slow).
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    logger_manager.record,
+                                    engine_idx=outputs.engine_index,
+                                    scheduler_stats=outputs.scheduler_stats,
+                                    iteration_stats=iteration_stats,
+                                    mm_cache_stats=renderer.stat_mm_cache(),
+                                )
+                            )
+                        except Exception:
+                            logger.exception("Failed to schedule logger_manager.record")
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
