@@ -282,6 +282,12 @@ class InprocClient(EngineCoreClient):
 
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
+        # Minimal resources object so callers that check
+        # `engine_core.resources.engine_dead` (e.g. AsyncLLM.errored)
+        # work when using an in-process client.
+        self.resources = type("_Res", (), {"engine_dead": False})()
+        # Single-engine ranks managed in inproc mode.
+        self.engine_ranks_managed = [0]
 
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
@@ -362,6 +368,110 @@ class InprocClient(EngineCoreClient):
     def dp_engines_running(self) -> bool:
         return False
 
+    # Async wrappers for in-process client so callers expecting async
+    # interfaces (e.g. AsyncLLM) can await these without blocking the
+    # event loop. They simply run the blocking sync methods in a thread.
+    async def get_output_async(self) -> EngineCoreOutputs:
+        import asyncio
+
+        return await asyncio.to_thread(self.get_output)
+
+    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+        import asyncio
+
+        return await asyncio.to_thread(self.get_supported_tasks)
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.add_request, request)
+
+    async def profile_async(self, is_start: bool = True) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.profile, is_start)
+
+    async def reset_mm_cache_async(self) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.reset_mm_cache)
+
+    async def reset_prefix_cache_async(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.reset_prefix_cache, reset_running_requests, reset_connector
+        )
+
+    async def sleep_async(self, level: int = 1) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.sleep, level)
+
+    async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.wake_up, tags)
+
+    async def is_sleeping_async(self) -> bool:
+        import asyncio
+
+        return await asyncio.to_thread(self.is_sleeping)
+
+    async def execute_dummy_batch_async(self) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.execute_dummy_batch)
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.abort_requests, request_ids)
+
+    async def add_lora_async(self, lora_request: LoRARequest) -> bool:
+        import asyncio
+
+        return await asyncio.to_thread(self.add_lora, lora_request)
+
+    async def remove_lora_async(self, lora_id: int) -> bool:
+        import asyncio
+
+        return await asyncio.to_thread(self.remove_lora, lora_id)
+
+    async def list_loras_async(self) -> set[int]:
+        import asyncio
+
+        return await asyncio.to_thread(self.list_loras)
+
+    async def pin_lora_async(self, lora_id: int) -> bool:
+        import asyncio
+
+        return await asyncio.to_thread(self.pin_lora, lora_id)
+
+    async def save_sharded_state_async(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.save_sharded_state, path, pattern, max_size)
+
+    async def collective_rpc_async(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        import asyncio
+
+        return await asyncio.to_thread(self.collective_rpc, method, timeout, args, kwargs)
+
+    async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
+        import asyncio
+
+        return await asyncio.to_thread(self.engine_core.scale_elastic_ep, new_data_parallel_size)
 
 @dataclass
 class BackgroundResources:
