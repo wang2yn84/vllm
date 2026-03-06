@@ -319,6 +319,35 @@ class IterationStats:
         field_to_value_str = ", ".join(f"{k}={v}" for k, v in vars(self).items())
         return f"{self.__class__.__name__}({field_to_value_str})"
 
+    def merge(self, other: "IterationStats") -> None:
+        """Merge another iteration stats object into this one."""
+        self.num_generation_tokens += other.num_generation_tokens
+
+        self.prompt_token_stats.computed += other.prompt_token_stats.computed
+        self.prompt_token_stats.local_cache_hit += (
+            other.prompt_token_stats.local_cache_hit
+        )
+        self.prompt_token_stats.external_kv_transfer += (
+            other.prompt_token_stats.external_kv_transfer
+        )
+        self.prompt_token_stats.cached_tokens += (
+            other.prompt_token_stats.cached_tokens
+        )
+        self.prompt_token_stats.recomputed_tokens += (
+            other.prompt_token_stats.recomputed_tokens
+        )
+        self.prompt_token_stats.total += other.prompt_token_stats.total
+
+        self.num_preempted_reqs += other.num_preempted_reqs
+        self.finished_requests.extend(other.finished_requests)
+        self.max_num_generation_tokens_iter.extend(
+            other.max_num_generation_tokens_iter
+        )
+        self.n_params_iter.extend(other.n_params_iter)
+        self.time_to_first_tokens_iter.extend(other.time_to_first_tokens_iter)
+        self.inter_token_latencies_iter.extend(other.inter_token_latencies_iter)
+        self.num_corrupted_reqs += other.num_corrupted_reqs
+
     @property
     def num_prompt_tokens(self) -> int:
         """Total prompt tokens (for backward compatibility)."""

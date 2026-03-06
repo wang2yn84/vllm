@@ -5,6 +5,7 @@ import os
 import socket
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
 from typing import Any
@@ -694,25 +695,53 @@ class AsyncLLM(EngineClient):
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
                     # event loop for too long.
                     engine_core_outputs = outputs.outputs
-                    for start in range(0, num_outputs, chunk_size):
-                        end = start + chunk_size
-                        outputs_slice = engine_core_outputs[start:end]
-                        # 2) Process EngineCoreOutputs.
-                        processed_outputs = output_processor.process_outputs(
-                            outputs_slice, outputs.timestamp, iteration_stats
-                        )
-                        # NOTE: RequestOutputs are pushed to their queues.
-                        assert not processed_outputs.request_outputs
+                    if num_outputs:
+                        chunks = [
+                            engine_core_outputs[start:start + chunk_size]
+                            for start in range(0, num_outputs, chunk_size)
+                        ]
+                        concurrency = max(1, num_outputs // chunk_size)
 
-                        # Allow other asyncio tasks to run between chunks
-                        if end < num_outputs:
-                            await asyncio.sleep(0)
+                        def _process_chunk(outputs_slice):
+                            chunk_stats = IterationStats() if log_stats else None
+                            if chunk_stats is not None and iteration_stats is not None:
+                                # Keep all per-chunk stats anchored to the same
+                                # iteration timestamp.
+                                chunk_stats.iteration_timestamp = (
+                                    iteration_stats.iteration_timestamp
+                                )
+
+                            processed = output_processor.process_outputs(
+                                outputs_slice,
+                                outputs.timestamp,
+                                chunk_stats,
+                            )
+                            return processed, chunk_stats
+
+                        loop = asyncio.get_running_loop()
+                        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                            futures = [
+                                loop.run_in_executor(executor, _process_chunk, chunk)
+                                for chunk in chunks
+                            ]
+                            chunk_results = await asyncio.gather(*futures)
+
+                        reqs_to_abort: list[str] = []
+                        for processed_outputs, chunk_stats in chunk_results:
+                            # NOTE: RequestOutputs are pushed to their queues.
+                            assert not processed_outputs.request_outputs
+
+                            if iteration_stats is not None and chunk_stats is not None:
+                                iteration_stats.merge(chunk_stats)
+
+                            if processed_outputs.reqs_to_abort:
+                                reqs_to_abort.extend(
+                                    processed_outputs.reqs_to_abort
+                                )
 
                         # 3) Abort any reqs that finished due to stop strings.
-                        if processed_outputs.reqs_to_abort:
-                            await engine_core.abort_requests_async(
-                                processed_outputs.reqs_to_abort
-                            )
+                        if reqs_to_abort:
+                            await engine_core.abort_requests_async(reqs_to_abort)
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 

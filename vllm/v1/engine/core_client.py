@@ -12,7 +12,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, TypeAlias, TypeVar
 
 import msgspec.msgpack
@@ -284,6 +284,57 @@ class InprocClient(EngineCoreClient):
         self.resources = type("_Res", (), {"engine_dead": False})()
         # Single-engine ranks managed in inproc mode.
         self.engine_ranks_managed = [0]
+        # Async output path for inproc mode: run step() in a dedicated
+        # background thread and hand outputs to asyncio via a queue.
+        self._async_outputs_queue: queue.Queue[EngineCoreOutputs | Exception] = (
+            queue.Queue()
+        )
+        self._async_step_wakeup = Event()
+        self._async_step_stop = Event()
+        self._async_step_thread: Thread | None = None
+
+    def _has_pending_work(self) -> bool:
+        batch_queue = getattr(self.engine_core, "batch_queue", None)
+        return self.engine_core.scheduler.has_requests() or bool(batch_queue)
+
+    def _ensure_async_step_thread(self) -> None:
+        if self._async_step_thread is not None:
+            return
+
+        def run_step_loop() -> None:
+            while not self._async_step_stop.is_set():
+                # Wait until there is work to do.
+                self._async_step_wakeup.wait(timeout=0.02)
+                if self._async_step_stop.is_set():
+                    return
+
+                if not self._has_pending_work():
+                    self._async_step_wakeup.clear()
+                    continue
+
+                try:
+                    outputs = self.get_output()
+                except Exception as e:
+                    self._async_outputs_queue.put(e)
+                    self._async_step_wakeup.clear()
+                    return
+
+                self._async_outputs_queue.put(outputs)
+
+                # If there is no more work, park the loop until the next add.
+                if not self._has_pending_work():
+                    self._async_step_wakeup.clear()
+                elif not outputs.outputs and not outputs.scheduler_stats:
+                    # Avoid tight spinning when requests are pending but not
+                    # currently producing outputs.
+                    self._async_step_stop.wait(timeout=0.001)
+
+        self._async_step_thread = Thread(
+            target=run_step_loop,
+            name="InprocEngineStepThread",
+            daemon=True,
+        )
+        self._async_step_thread.start()
 
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
@@ -296,12 +347,19 @@ class InprocClient(EngineCoreClient):
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
+        self._async_step_wakeup.set()
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+            self._async_step_wakeup.set()
 
     def shutdown(self) -> None:
+        self._async_step_stop.set()
+        self._async_step_wakeup.set()
+        if self._async_step_thread is not None:
+            self._async_step_thread.join(timeout=1.0)
+            self._async_step_thread = None
         self.engine_core.shutdown()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
@@ -328,6 +386,7 @@ class InprocClient(EngineCoreClient):
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.engine_core.wake_up(tags)
+        self._async_step_wakeup.set()
 
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
@@ -366,11 +425,15 @@ class InprocClient(EngineCoreClient):
 
     # Async wrappers for in-process client so callers expecting async
     # interfaces (e.g. AsyncLLM) can await these without blocking the
-    # event loop. They simply run the blocking sync methods in a thread.
+    # event loop.
     async def get_output_async(self) -> EngineCoreOutputs:
         import asyncio
 
-        return await asyncio.to_thread(self.get_output)
+        self._ensure_async_step_thread()
+        outputs = await asyncio.to_thread(self._async_outputs_queue.get)
+        if isinstance(outputs, Exception):
+            raise outputs
+        return outputs
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         import asyncio
